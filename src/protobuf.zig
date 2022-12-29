@@ -1,5 +1,5 @@
 const std = @import("std");
-const StructField = std.builtin.TypeInfo.StructField;
+const StructField = std.builtin.Type.StructField;
 const isSignedInt = std.meta.trait.isSignedInt;
 const isIntegral = std.meta.trait.isIntegral;
 const Allocator = std.mem.Allocator;
@@ -43,7 +43,7 @@ pub const KeyValueType = union(KeyValueTypeTag) {
     SubMessage,
     List: ListType,
 
-    pub fn toFieldType(self: KeyValueType) FieldType {
+    pub fn toFieldType(comptime self: KeyValueType) FieldType {
         return switch (self) {
             .Varint => |varint_type| .{ .Varint = varint_type },
             .FixedInt => .{.FixedInt},
@@ -361,7 +361,7 @@ fn internal_pb_encode(pb: *ArrayList(u8), data: anytype) !void {
     const data_type = @TypeOf(data);
 
     inline for (field_list) |field| {
-        if (@typeInfo(field.field_type) == .Optional) {
+        if (@typeInfo(field.type) == .Optional) {
             if (@field(data, field.name)) |value| {
                 try append(pb, @field(data_type._desc_table, field.name), @TypeOf(value), value);
             }
@@ -396,10 +396,17 @@ pub fn pb_init(comptime T: type, allocator: Allocator) T {
     inline for (@typeInfo(T).Struct.fields) |field| {
         switch (@field(T._desc_table, field.name).ftype) {
             .Varint, .FixedInt, .SubMessage => {
+                if (@TypeOf(@field(value, field.name)) == ?u32 and @TypeOf(field.default_value) == ?*const anyopaque)
+                    continue;
                 @field(value, field.name) = if (field.default_value) |val| val else null;
             },
             .List, .Map => {
-                @field(value, field.name) = @TypeOf(@field(value, field.name)).init(allocator);
+                const field_type = @TypeOf(@field(value, field.name));
+                @field(value, field.name) = switch (@typeInfo(field_type)) {
+                    .Optional => |optional| optional.child.init(allocator),
+                    .Struct => field_type.init(allocator),
+                    else => @compileError("invalid type"),
+                };
             },
             .OneOf => {
                 @field(value, field.name) = null;
@@ -424,7 +431,8 @@ fn deinit_field(field: anytype, comptime field_name: []const u8, comptime ftype:
     switch (ftype) {
         .Varint, .FixedInt => {},
         .SubMessage => {
-            @field(field, field_name).deinit();
+            if (@field(field, field_name)) |opt|
+                opt.deinit();
         },
         .List => |list_type| {
             if (list_type == .SubMessage) {
@@ -432,7 +440,12 @@ fn deinit_field(field: anytype, comptime field_name: []const u8, comptime ftype:
                     item.deinit();
                 }
             }
-            @field(field, field_name).deinit();
+            switch (@typeInfo(@TypeOf(@field(field, field_name)))) {
+                .Optional => |_| if (@field(field, field_name)) |opt|
+                    opt.deinit(),
+                .Struct => @field(field, field_name).deinit(),
+                else => @compileError("invalid type"),
+            }
         },
         .OneOf => |union_type| {
             if (@field(field, field_name)) |union_value| {
@@ -628,7 +641,11 @@ const WireDecoderIterator = struct {
                     state.current_index += size.value + size.size;
                     break :blk value;
                 },
-                else => @panic("Not implemented yet"),
+                3, 4 => return state.next(),
+                else => |val| {
+                    std.debug.print("wire_value: {d}\n", .{val});
+                    @panic("Not implemented yet");
+                },
             };
 
             return Extracted{ .tag = tag, .data = data };
@@ -697,10 +714,10 @@ fn decode_list(input: []const u8, comptime list_type: ListType, comptime T: type
     }
 }
 
-fn decode_data(comptime T: type, field_desc: FieldDescriptor, field: StructField, result: *T, extracted_data: Extracted, allocator: Allocator) !void {
+fn decode_data(comptime T: type, comptime field_desc: FieldDescriptor, comptime field: StructField, result: *T, extracted_data: Extracted, allocator: Allocator) !void {
     switch (field_desc.ftype) {
         .Varint, .FixedInt, .SubMessage => {
-            const child_type = @typeInfo(field.field_type).Optional.child;
+            const child_type = @typeInfo(field.type).Optional.child;
 
             @field(result, field.name) = switch (field_desc.ftype) {
                 .Varint => |varint_type| get_varint_value(child_type, varint_type, extracted_data.data.RawValue),
@@ -710,8 +727,20 @@ fn decode_data(comptime T: type, field_desc: FieldDescriptor, field: StructField
             };
         },
         .List => |list_type| {
-            const child_type = @typeInfo(@TypeOf(@field(result, field.name).items)).Pointer.child;
-            try decode_list(extracted_data.data.Slice, list_type, child_type, &@field(result, field.name), allocator);
+            const field_type = @TypeOf(@field(result, field.name));
+            const field_child_type = switch (@typeInfo(field_type)) {
+                .Optional => |optional| optional.child,
+                .Struct => field_type.init(allocator),
+                else => @compileError("invalid type"),
+            };
+
+            const child_type = @typeInfo(std.meta.fieldInfo(field_child_type, .items).type).Pointer.child;
+            const field_ptr = switch (@typeInfo(field_type)) {
+                .Optional => |_| &@field(result, field.name).?,
+                .Struct => &@field(result, field.name),
+                else => @compileError("invalid type"),
+            };
+            try decode_list(extracted_data.data.Slice, list_type, child_type, field_ptr, allocator);
         },
         .Map => |map_data| {
             const map_type = get_map_submessage_type(map_data);
@@ -734,7 +763,7 @@ fn is_tag_known(comptime field_desc: FieldDescriptor, comptime T: type, tag_to_c
     } else {
         const desc_union = field_desc.ftype.OneOf._union_desc;
         inline for (@typeInfo(@TypeOf(desc_union)).Struct.fields) |union_field| {
-            if (is_tag_known(@field(desc_union, union_field.name), union_field.field_type, tag_to_check)) {
+            if (is_tag_known(@field(desc_union, union_field.name), union_field.type, tag_to_check)) {
                 return true;
             }
         }
@@ -751,13 +780,12 @@ pub fn pb_decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
     var iterator = WireDecoderIterator{ .input = input };
 
     while (try iterator.next()) |extracted_data| {
-        const field_found: ?StructField = inline for (@typeInfo(T).Struct.fields) |field| {
-            if (is_tag_known(@field(T._desc_table, field.name), field.field_type, extracted_data.tag)) {
-                break field;
+        inline for (@typeInfo(T).Struct.fields) |field| {
+            if (is_tag_known(@field(T._desc_table, field.name), field.type, extracted_data.tag)) {
+                try decode_data(T, @field(T._desc_table, field.name), field, &result, extracted_data, allocator);
+                break;
             }
-        } else null;
-
-        if (field_found) |field| try decode_data(T, @field(T._desc_table, field.name), field, &result, extracted_data, allocator);
+        }
     }
 
     return result;

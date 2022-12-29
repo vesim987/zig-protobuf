@@ -14,17 +14,14 @@ pub fn build(b: *std.build.Builder) void {
         b.addTest("src/tests.zig"),
         b.addTest("tests/alltypes.zig"),
         b.addTest("tests/tests_fixedsizes.zig"),
-        b.addTest("tests/tests_varints.zig")
+        b.addTest("tests/tests_varints.zig"),
     };
 
     const test_step = b.step("test", "Run library tests");
-    for(tests) |test_item| {
-        test_item.addPackage(.{
-            .name = "protobuf",
-            .path = std.build.FileSource{.path = "src/protobuf.zig"}
-        });
+
+    for (tests) |test_item| {
+        test_item.addPackage(.{ .name = "protobuf", .source = std.build.FileSource{ .path = "src/protobuf.zig" } });
         test_item.setBuildMode(mode);
         test_step.dependOn(&test_item.step);
     }
-
 }
